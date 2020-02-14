@@ -4,6 +4,148 @@ require 'pathname'
 require 'net/http'
 require 'uri'
 
+# Added these includes to try and capture packets
+require 'openssl'
+require 'ffi/pcap'
+
+module SSLKeyExport
+
+  # Attempt to override the default behaviour of Net::HTTP.connect (https://docs.ruby-lang.org/en/2.4.0/Net/HTTP.html#method-i-connect)
+  # using example from https://www.trustwave.com/en-us/resources/blogs/spiderlabs-blog/how-to-decrypt-ruby-ssl-communications-with-wireshark/
+  # --
+  # So far working with session id and client key but not with client random?
+  def connect
+
+    if proxy? then
+      conn_address = proxy_address
+      conn_port    = proxy_port
+    else
+      conn_address = address
+      conn_port    = port
+    end
+
+    D "opening connection to #{conn_address}:#{conn_port}..."
+    s = Timeout.timeout(@open_timeout, Net::OpenTimeout) {
+      begin
+        TCPSocket.open(conn_address, conn_port, @local_host, @local_port)
+      rescue => e
+        raise e, "Failed to open TCP connection to " +
+          "#{conn_address}:#{conn_port} (#{e.message})"
+      end
+    }
+    s.setsockopt(Socket::IPPROTO_TCP, Socket::TCP_NODELAY, 1)
+    D "opened"
+    if use_ssl?
+      if proxy?
+        plain_sock = BufferedIO.new(s, read_timeout: @read_timeout,
+                                    continue_timeout: @continue_timeout,
+                                    debug_output: @debug_output)
+        buf = "CONNECT #{@address}:#{@port} HTTP/#{HTTPVersion}\r\n"
+        buf << "Host: #{@address}:#{@port}\r\n"
+        if proxy_user
+          credential = ["#{proxy_user}:#{proxy_pass}"].pack('m0')
+          buf << "Proxy-Authorization: Basic #{credential}\r\n"
+        end
+        buf << "\r\n"
+        plain_sock.write(buf)
+        HTTPResponse.read_new(plain_sock).value
+        # assuming nothing left in buffers after successful CONNECT response
+      end
+
+      ssl_parameters = Hash.new
+      iv_list = instance_variables
+      Net::HTTP::SSL_IVNAMES.each_with_index do |ivname, i|
+        if iv_list.include?(ivname) and
+            value = instance_variable_get(ivname)
+          ssl_parameters[Net::HTTP::SSL_ATTRIBUTES[i]] = value if value
+        end
+      end
+      @ssl_context = OpenSSL::SSL::SSLContext.new
+      @ssl_context.set_params(ssl_parameters)
+      @ssl_context.session_cache_mode =
+        OpenSSL::SSL::SSLContext::SESSION_CACHE_CLIENT |
+        OpenSSL::SSL::SSLContext::SESSION_CACHE_NO_INTERNAL_STORE
+      @ssl_context.session_new_cb = proc {|sock, sess| @ssl_session = sess }
+      D "starting SSL for #{conn_address}:#{conn_port}..."
+      s = OpenSSL::SSL::SSLSocket.new(s, @ssl_context)
+      s.sync_close = true
+      # Server Name Indication (SNI) RFC 3546
+      s.hostname = @address if s.respond_to? :hostname=
+      if @ssl_session and
+          Process.clock_gettime(Process::CLOCK_REALTIME) < @ssl_session.time.to_f + @ssl_session.timeout
+        s.session = @ssl_session
+      end
+
+      # FIXME: Start checking packets
+      #
+      pcap = FFI::PCap::Live.new(:device  => "ens33", :timeout => 1, :handler => nil)
+      # filtering on only tcp packets with PSH flag, SSL Handshake Content type and the Client Hello Handshake Type
+      # pcap.setfilter("tcp dst port 443 and tcp[13]&8!=0 and tcp[32]==22 and tcp[37]==1")
+      pcap.setfilter("dst host 172.16.134.10 and tcp dst port 443 and tcp[13]&8!=0 and tcp[32]==22 and tcp[37]==1")
+      pcap.non_blocking = true
+      #
+      # End of checking packets
+
+      ssl_socket_connect(s, @open_timeout)
+      if @ssl_context.verify_mode != OpenSSL::SSL::VERIFY_NONE
+        s.post_connection_check(@address)
+      end
+      D "SSL established"
+
+    end
+    @socket = Net::BufferedIO.new(s, read_timeout: @read_timeout, continue_timeout: @continue_timeout, debug_output: @debug_output)
+    on_connect
+
+    # FIXME: Parsing of the pcap file
+    #
+    if use_ssl?
+      client_random = ""
+      pcap.dispatch(:count => 1) do |this, pkt|
+        pkt.body[77,32].each_byte { |byte| client_random << "%02X" % byte.ord }
+      end
+      pcap.close
+
+      session_id = ""
+      master_key = ""
+
+      s.session.to_text.each_line do |line|
+        if match = line.match(/Session-ID\s*: (?<session_id>.*)/)
+          session_id = match[:session_id]
+        end
+        if match = line.match(/Master-Key\s*: (?<master_key>.*)/)
+          master_key = match[:master_key]
+        end
+      end
+
+      # Create a log dir if one doesn't exist
+      tmp_dir = "#{__dir__}/../tmp"
+      Dir.mkdir(tmp_dir) unless File.exists?(tmp_dir)
+    
+      File.open("#{tmp_dir}/ssl.log", "a") do |file|
+        # file.write("CLIENT_RANDOM #{client_random} #{master_key}\n") unless client_random.empty?
+        # FIXME: Not getting the client random from the ssl connection?
+        file.write("CLIENT_RANDOM #{client_random} #{master_key}\n")
+        file.write("RSA Session-ID:#{session_id} Master-Key:#{master_key}\n") unless session_id.empty?
+      end
+    end
+    #
+    # End of parsing of the pcap file
+
+  rescue => exception
+    if s
+      D "Conn close because of connect error #{exception}"
+      s.close
+    end
+    raise
+  end
+
+end
+
+# Insert the methods into Net::HTTP 
+class Net::HTTP
+  prepend SSLKeyExport
+end
+
 require 'httparty/module_inheritable_attributes'
 require 'httparty/cookie_hash'
 require 'httparty/net_digest_auth'
